@@ -1,0 +1,16 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "saath-e an online agentic support"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pipecat-ai[cartesia,daily,deepgram,google,keenable,kokoro,openai,runner,silero,webrtc,whisper]>=1.4.0",
+    "pipecatcloud",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    "python-dotenv>=1.0.1",
+    "loguru>=0.7.3",
+    "faster-whisper>=1.2.1",
+]
