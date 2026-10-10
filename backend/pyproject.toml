@@ -13,4 +13,11 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "loguru>=0.7.3",
     "faster-whisper>=1.2.1",
+    "langgraph>=1.2.14",
+    "langchain-core>=1.6.7",
+    "langchain-ollama>=1.1.0",
+    "langchain>=1.4.3",
+    "pdfplumber>=0.11.10",
+    "langchain-community>=0.4.2",
+    "ddgs>=9.16.0",
 ]

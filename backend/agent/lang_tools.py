@@ -1,14 +1,22 @@
+from langchain.tools import tool
+import re, os
 import asyncio
-import os
-import re
 import smtplib
-from email.message import EmailMessage
-
-from dotenv import load_dotenv
 from loguru import logger
-from pipecat.services.llm_service import FunctionCallParams
+from dotenv import load_dotenv
+from langchain_community.tools import DuckDuckGoSearchRun
+from email.message import EmailMessage
+search_tool = DuckDuckGoSearchRun()
 
-load_dotenv(override=True)
+load_dotenv()
+
+
+@tool
+def get_current_time() -> str:
+    """Get current local time. Use when user asks time/date."""
+    from datetime import datetime
+
+    return datetime.now().isoformat()
 
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -80,8 +88,9 @@ def _send_email_sync(recipient: str, subject: str, body: str) -> str:
         return f"Failed to send email: {e}"
 
 
+@tool
 async def write_email(
-    params: FunctionCallParams, recipient: str, subject: str, body: str
+    recipient: str, subject: str, body: str
 ):
     """Send an email to a recipient.
 
@@ -90,32 +99,23 @@ async def write_email(
         subject: The subject line of the email.
         body: The plain-text body of the email.
     """
-    # Pipecat passes the tool arguments by keyword (``function(params=..., **args)``)
-    # and reads the schema from this signature, so recipient/subject/body must be
-    # real parameters here. The result is delivered only through result_callback;
-    # a plain ``return`` would be discarded and the tool call would never settle.
-
     recipient = normalize_email(recipient)
     if not _EMAIL_RE.match(recipient):
-        # Hand it back to the LLM to ask the user to repeat the address, instead
-        # of guessing (guessing is how "edgewater@gmail.com" got invented).
-        await params.result_callback(
-            {
-                "status": "invalid_recipient",
-                "recipient": recipient,
-                "message": (
-                    f"'{recipient}' is not a valid email address. Ask the user to "
-                    "repeat it slowly, letter by letter, then confirm before sending."
-                ),
-            }
-        )
-        return
-
-    result = await asyncio.to_thread(_send_email_sync, recipient, subject, body)
-    await params.result_callback({"status": result})
+        return f"INVALID_RECIPIENT '{recipient}'... ask user to repeat slowly..."
+    return await asyncio.to_thread(_send_email_sync, recipient, subject, body)
 
 
-async def get_current_time(params: FunctionCallParams):
-    """Get current local time. Use when user asks time/date."""
-    from datetime import datetime
-    await params.result_callback({"time": datetime.now().isoformat()})
+@tool
+def web_search(query: str) -> str:
+    """Search the web to find accurate answers.
+
+    Args:
+        query: The question to search in the web to find answers.
+    """
+    try:
+        return search_tool.invoke(query)
+    except Exception as e:
+        return f"An error occurred while searching the web: {str(e)}"
+
+
+tools = [write_email, get_current_time, web_search]

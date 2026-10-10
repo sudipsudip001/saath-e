@@ -1,57 +1,35 @@
 import os
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.workers.runner import WorkerRunner
 from pipecat.frames.frames import Frame, LLMRunFrame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 # from pipecat.services.cartesia.tts import CartesiaTTSService# NEED TO CHANGE THIS
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.transcriptions.language import Language
-from pipecat.services.keenable.search import KeenableWebSearch
 # from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.whisper.stt import WhisperSTTService
-from pipecat.services.ollama.llm import OLLamaLLMService
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.processors.audio.vad_processor import VADProcessor
+from agent.service import LangGraphProcessor
+from agent.graph import Graph
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from dotenv import load_dotenv
 from typing import Any
-from agent.tools import get_current_time, write_email
 from loguru import logger
+from agent.prompts import DEFAULT_SYSTEM_INSTRUCTION
+
 
 load_dotenv(override=True)
 
-DEFAULT_SYSTEM_INSTRUCTION = (
-    """
-    You are saath-e a helpful voice assistant, often talking to elderly users.
-    Help user to perform tasks using the knowledge and resources that you have.
-    Use the search tool for current events/weather/news or anything uncertain.
-    You can also use email tools to write emails to the person mentioned, so expect
-    email addresses spelled letter by letter, e.g. sudip at gmail dot com.
-    When you build the address, convert spoken punctuation ("at" -> "@",
-    "dot" -> ".", "underscore" -> "_", "dash"/"hyphen" -> "-") and join letters
-    that were spelled out separately (e.g. "d h e n d a r" -> "dhendar").
-    Never invent or guess an email address; if it is unclear, ask the user to
-    repeat it slowly, letter by letter.
-    If you're sending an email, always CONFIRM the recipient, subject and body
-    with the user before proceeding.
-    Keep the responses brief and avoid using long conversation format.
-    """
-)
 
 DEFAULT_GREETING = "Start by concisely introducing yourself as Saath E."
 
 DEFAULT_VOICE_ID = "86e30c1d-714b-4074-a1f2-1cb6b552fb49"
-search = KeenableWebSearch()
 
 
 class TranscriptLogger(FrameProcessor):
@@ -93,6 +71,7 @@ def session_settings(runner_args: RunnerArguments) -> dict[str, str]:
     }
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
+    graph = Graph().build()
     settings = session_settings(runner_args)
     session_id = getattr(runner_args, "session_id", None) or "unknown"
     logger.info(f'Starting bot session {session_id}')
@@ -121,48 +100,43 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     transcript_logger = TranscriptLogger()
 
+    # WhisperSTTService subclasses SegmentedSTTService, which only transcribes
+    # when it sees VADUserStarted/StoppedSpeakingFrames. The old pipeline got
+    # those from LLMUserAggregatorParams; with the aggregators gone we need this
+    # standalone VAD processor or the STT never emits a TranscriptionFrame.
+    vad = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
+    )
+
     tts = KokoroTTSService(
         settings=KokoroTTSService.Settings(
             voice="af_heart",
             language=Language.EN_US,
         ),
+        # kokoro-onnx synthesizes the entire utterance before yielding its first
+        # (and only) audio chunk, so time-to-first-audio grows with reply length
+        # (~0.23x realtime). Pipecat's 3.0s default closes the audio context
+        # before longer replies produce any audio -> "completed with no audio",
+        # and after 3 in a row the service is marked unusable. Give synth room.
+        stop_frame_timeout_s=20.0,
     )
 
-    llm = OLLamaLLMService(
-        base_url=os.getenv("OLLAMA_BASE_URL"),
-        settings=OLLamaLLMService.Settings(
-            model=settings["llm_model"],
-            system_instruction=settings["system_instruction"],
-        ),
-    )
-
-    # search.tools() returns a ToolsSchema (its MCP handlers live inside each
-    # FunctionSchema), so merge its standard_tools with our direct functions
-    # rather than unpacking the ToolsSchema itself.
-    search_tools = await search.tools()
-    context = LLMContext(
-        tools=ToolsSchema(
-            standard_tools=[*search_tools.standard_tools, get_current_time, write_email],
-            custom_tools=search_tools.custom_tools,
-        )
-    )
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
-        ),
+    processor = LangGraphProcessor(
+        graph,
+        session_id,
+        settings["greeting"],
+        system_instruction=settings["system_instruction"],
     )
 
     pipeline = Pipeline(
         [
             transport.input(),
+            vad,
             stt,
             transcript_logger,
-            user_aggregator,
-            llm,
+            processor,
             tts,
             transport.output(),
-            assistant_aggregator,
         ]
     )
 
@@ -181,7 +155,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     @worker.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
-        context.add_message({"role": "developer", "content": settings["greeting"]})
         await worker.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_connected")
